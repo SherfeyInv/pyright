@@ -148,8 +148,8 @@ import {
     getTypeOfUnaryOperation,
 } from './operations';
 import {
+    ParameterKind,
     ParameterListDetails,
-    ParameterSource,
     VirtualParameterDetails,
     getParameterListDetails,
     isParamSpecArgsArgument,
@@ -1071,9 +1071,85 @@ export function createTypeEvaluator(
         // at that point.
         initializedBasicTypes(node);
 
+        let typeResult = getTypeOfExpressionCore(node, flags, inferenceContext, signatureTracker);
+
+        // Should we disable type promotions for bytes?
+        if (
+            isInstantiableClass(typeResult.type) &&
+            typeResult.type.includePromotions &&
+            !typeResult.type.includeSubclasses &&
+            ClassType.isBuiltIn(typeResult.type, 'bytes')
+        ) {
+            if (AnalyzerNodeInfo.getFileInfo(node).diagnosticRuleSet.disableBytesTypePromotions) {
+                typeResult = {
+                    ...typeResult,
+                    type: ClassType.cloneRemoveTypePromotions(typeResult.type),
+                };
+            }
+        }
+
+        // Don't allow speculative caching for assignment expressions because
+        // the target name node won't have a corresponding type cached speculatively.
+        const allowSpeculativeCaching = node.nodeType !== ParseNodeType.AssignmentExpression;
+
+        writeTypeCache(node, typeResult, flags, inferenceContext, allowSpeculativeCaching);
+
+        // If there was an expected type, make sure that the result type is compatible.
+        if (
+            inferenceContext &&
+            !isAnyOrUnknown(inferenceContext.expectedType) &&
+            !isNever(inferenceContext.expectedType)
+        ) {
+            expectedTypeCache.set(node.id, inferenceContext.expectedType);
+
+            // If this is a generic function and there is a signature tracker,
+            // make sure the signature is unique.
+            if (signatureTracker && isFunction(typeResult.type)) {
+                typeResult.type = ensureFunctionSignaturesAreUnique(typeResult.type, signatureTracker, node.start);
+            }
+
+            if (!typeResult.isIncomplete && !typeResult.expectedTypeDiagAddendum) {
+                const diag = new DiagnosticAddendum();
+
+                // Make sure the resulting type is assignable to the expected type.
+                if (
+                    !assignType(
+                        inferenceContext.expectedType,
+                        typeResult.type,
+                        diag,
+                        /* destTypeVarContext */ undefined,
+                        /* srcTypeVarContext */ undefined,
+                        AssignTypeFlags.IgnoreTypeVarScope
+                    )
+                ) {
+                    typeResult.typeErrors = true;
+                    typeResult.expectedTypeDiagAddendum = diag;
+                    diag.addTextRange(node);
+                }
+            }
+        }
+
+        if (printExpressionTypes) {
+            printExpressionSpaceCount--;
+            console.log(
+                `${getPrintExpressionTypesSpaces()}${ParseTreeUtils.printExpression(node)} (${getLineNum(
+                    node
+                )}): Post ${printType(typeResult.type)}${typeResult.isIncomplete ? ' Incomplete' : ''}`
+            );
+        }
+
+        return typeResult;
+    }
+
+    // This is a helper function that implements the core of getTypeOfExpression.
+    function getTypeOfExpressionCore(
+        node: ExpressionNode,
+        flags = EvaluatorFlags.None,
+        inferenceContext?: InferenceContext,
+        signatureTracker?: UniqueSignatureTracker
+    ): TypeResult {
         let typeResult: TypeResult | undefined;
         let expectingInstantiable = (flags & EvaluatorFlags.ExpectingInstantiableType) !== 0;
-        let allowSpeculativeCaching = true;
 
         switch (node.nodeType) {
             case ParseNodeType.Name: {
@@ -1175,7 +1251,7 @@ export function createTypeEvaluator(
             }
 
             case ParseNodeType.ListComprehension: {
-                typeResult = getTypeOfListComprehension(node, inferenceContext);
+                typeResult = getTypeOfListComprehension(node, flags, inferenceContext);
                 break;
             }
 
@@ -1215,10 +1291,6 @@ export function createTypeEvaluator(
                     node.rightExpression,
                     /* ignoreEmptyContainers */ true
                 );
-
-                // Don't allow speculative caching for assignment expressions because
-                // the target name node won't have a corresponding type cached speculatively.
-                allowSpeculativeCaching = false;
                 break;
             }
 
@@ -1280,67 +1352,6 @@ export function createTypeEvaluator(
         // Do we need to validate that the type is instantiable?
         if (expectingInstantiable) {
             validateTypeIsInstantiable(typeResult, flags, node);
-        }
-
-        // Should we disable type promotions for bytes?
-        if (
-            isInstantiableClass(typeResult.type) &&
-            typeResult.type.includePromotions &&
-            !typeResult.type.includeSubclasses &&
-            ClassType.isBuiltIn(typeResult.type, 'bytes')
-        ) {
-            if (AnalyzerNodeInfo.getFileInfo(node).diagnosticRuleSet.disableBytesTypePromotions) {
-                typeResult = {
-                    ...typeResult,
-                    type: ClassType.cloneRemoveTypePromotions(typeResult.type),
-                };
-            }
-        }
-
-        writeTypeCache(node, typeResult, flags, inferenceContext, allowSpeculativeCaching);
-
-        // If there was an expected type, make sure that the result type is compatible.
-        if (
-            inferenceContext &&
-            !isAnyOrUnknown(inferenceContext.expectedType) &&
-            !isNever(inferenceContext.expectedType)
-        ) {
-            expectedTypeCache.set(node.id, inferenceContext.expectedType);
-
-            // If this is a generic function and there is a signature tracker,
-            // make sure the signature is unique.
-            if (signatureTracker && isFunction(typeResult.type)) {
-                typeResult.type = ensureFunctionSignaturesAreUnique(typeResult.type, signatureTracker, node.start);
-            }
-
-            if (!typeResult.isIncomplete && !typeResult.expectedTypeDiagAddendum) {
-                const diag = new DiagnosticAddendum();
-
-                // Make sure the resulting type is assignable to the expected type.
-                if (
-                    !assignType(
-                        inferenceContext.expectedType,
-                        typeResult.type,
-                        diag,
-                        /* destTypeVarContext */ undefined,
-                        /* srcTypeVarContext */ undefined,
-                        AssignTypeFlags.IgnoreTypeVarScope
-                    )
-                ) {
-                    typeResult.typeErrors = true;
-                    typeResult.expectedTypeDiagAddendum = diag;
-                    diag.addTextRange(node);
-                }
-            }
-        }
-
-        if (printExpressionTypes) {
-            printExpressionSpaceCount--;
-            console.log(
-                `${getPrintExpressionTypesSpaces()}${ParseTreeUtils.printExpression(node)} (${getLineNum(
-                    node
-                )}): Post ${printType(typeResult.type)}${typeResult.isIncomplete ? ' Incomplete' : ''}`
-            );
         }
 
         return typeResult;
@@ -7826,6 +7837,12 @@ export function createTypeEvaluator(
             return { type: makeTupleObject([]), isEmptyTupleShorthand: true };
         }
 
+        flags &= ~(
+            EvaluatorFlags.ExpectingTypeAnnotation |
+            EvaluatorFlags.EvaluateStringLiteralAsType |
+            EvaluatorFlags.ExpectingInstantiableType
+        );
+
         // If the expected type is a union, recursively call for each of the subtypes
         // to find one that matches.
         let effectiveExpectedType = inferenceContext?.expectedType;
@@ -7845,6 +7862,7 @@ export function createTypeEvaluator(
                         const subtypeResult = useSpeculativeMode(node, () => {
                             return getTypeOfTupleWithContext(
                                 node,
+                                flags,
                                 makeInferenceContext(subtype),
                                 /* signatureTracker */ undefined
                             );
@@ -7865,6 +7883,7 @@ export function createTypeEvaluator(
         if (effectiveExpectedType) {
             const result = getTypeOfTupleWithContext(
                 node,
+                flags,
                 makeInferenceContext(effectiveExpectedType),
                 signatureTracker
             );
@@ -7876,7 +7895,7 @@ export function createTypeEvaluator(
             expectedTypeDiagAddendum = result?.expectedTypeDiagAddendum;
         }
 
-        const typeResult = getTypeOfTupleInferred(node);
+        const typeResult = getTypeOfTupleInferred(node, flags);
 
         // If there was an expected type of Any, replace the resulting type
         // with Any rather than return a type with unknowns.
@@ -7889,6 +7908,7 @@ export function createTypeEvaluator(
 
     function getTypeOfTupleWithContext(
         node: TupleNode,
+        flags: EvaluatorFlags,
         inferenceContext: InferenceContext,
         signatureTracker: UniqueSignatureTracker | undefined
     ): TypeResult | undefined {
@@ -7947,7 +7967,7 @@ export function createTypeEvaluator(
         const entryTypeResults = node.expressions.map((expr, index) =>
             getTypeOfExpression(
                 expr,
-                /* flags */ undefined,
+                flags | EvaluatorFlags.StripLiteralTypeForTuple,
                 makeInferenceContext(
                     index < expectedTypes.length ? expectedTypes[index] : undefined,
                     inferenceContext.isTypeIncomplete
@@ -7956,7 +7976,7 @@ export function createTypeEvaluator(
             )
         );
         const isIncomplete = entryTypeResults.some((result) => result.isIncomplete);
-        const type = makeTupleObject(buildTupleTypesList(entryTypeResults));
+        const type = makeTupleObject(buildTupleTypesList(entryTypeResults, /* stripLiterals */ false));
 
         // Copy any expected type diag addenda for precision error reporting.
         let expectedTypeDiagAddendum: DiagnosticAddendum | undefined;
@@ -7972,11 +7992,15 @@ export function createTypeEvaluator(
         return { type, expectedTypeDiagAddendum, isIncomplete };
     }
 
-    function getTypeOfTupleInferred(node: TupleNode): TypeResult {
-        const entryTypeResults = node.expressions.map((expr) => getTypeOfExpression(expr));
+    function getTypeOfTupleInferred(node: TupleNode, flags: EvaluatorFlags): TypeResult {
+        const entryTypeResults = node.expressions.map((expr) =>
+            getTypeOfExpression(expr, flags | EvaluatorFlags.StripLiteralTypeForTuple)
+        );
         const isIncomplete = entryTypeResults.some((result) => result.isIncomplete);
 
-        const type = makeTupleObject(buildTupleTypesList(entryTypeResults));
+        const type = makeTupleObject(
+            buildTupleTypesList(entryTypeResults, (flags & EvaluatorFlags.StripLiteralTypeForTuple) !== 0)
+        );
 
         if (isIncomplete) {
             if (getContainerDepth(type) > maxInferredContainerDepth) {
@@ -7987,7 +8011,7 @@ export function createTypeEvaluator(
         return { type, isIncomplete };
     }
 
-    function buildTupleTypesList(entryTypeResults: TypeResult[]): TupleTypeArgument[] {
+    function buildTupleTypesList(entryTypeResults: TypeResult[], stripLiterals: boolean): TupleTypeArgument[] {
         const entryTypes: TupleTypeArgument[] = [];
 
         for (const typeResult of entryTypeResults) {
@@ -8017,7 +8041,8 @@ export function createTypeEvaluator(
             } else if (isNever(typeResult.type) && typeResult.isIncomplete && !typeResult.unpackedType) {
                 entryTypes.push({ type: UnknownType.create(/* isIncomplete */ true), isUnbounded: false });
             } else {
-                entryTypes.push({ type: typeResult.type, isUnbounded: !!typeResult.unpackedType });
+                const entryType = stripLiterals ? stripLiteralValue(typeResult.type) : typeResult.type;
+                entryTypes.push({ type: entryType, isUnbounded: !!typeResult.unpackedType });
             }
         }
 
@@ -10227,7 +10252,7 @@ export function createTypeEvaluator(
                 paramMap.set(param.name, {
                     argsNeeded: param.category === ParameterCategory.Simple && !param.hasDefault ? 1 : 0,
                     argsReceived: 0,
-                    isPositionalOnly: paramInfo.source === ParameterSource.PositionOnly,
+                    isPositionalOnly: paramInfo.kind === ParameterKind.Positional,
                 });
             }
         });
@@ -13318,7 +13343,7 @@ export function createTypeEvaluator(
                     }
 
                     const subtypeResult = useSpeculativeMode(node, () => {
-                        return getTypeOfDictionaryWithContext(node, makeInferenceContext(subtype));
+                        return getTypeOfDictionaryWithContext(node, flags, makeInferenceContext(subtype));
                     });
 
                     if (subtypeResult && assignType(subtype, subtypeResult.type)) {
@@ -13341,6 +13366,7 @@ export function createTypeEvaluator(
             expectedTypeDiagAddendum = new DiagnosticAddendum();
             const result = getTypeOfDictionaryWithContext(
                 node,
+                flags,
                 makeInferenceContext(effectiveExpectedType),
                 expectedTypeDiagAddendum
             );
@@ -13349,12 +13375,13 @@ export function createTypeEvaluator(
             }
         }
 
-        const result = getTypeOfDictionaryInferred(node, /* hasExpectedType */ !!inferenceContext);
+        const result = getTypeOfDictionaryInferred(node, flags, /* hasExpectedType */ !!inferenceContext);
         return { ...result, expectedTypeDiagAddendum };
     }
 
     function getTypeOfDictionaryWithContext(
         node: DictionaryNode,
+        flags: EvaluatorFlags,
         inferenceContext: InferenceContext,
         expectedDiagAddendum?: DiagnosticAddendum
     ): TypeResult | undefined {
@@ -13381,6 +13408,7 @@ export function createTypeEvaluator(
             // Infer the key and value types if possible.
             const keyValueTypeResult = getKeyAndValueTypesFromDictionary(
                 node,
+                flags,
                 keyTypes,
                 valueTypes,
                 /* forceStrictInference */ true,
@@ -13472,6 +13500,7 @@ export function createTypeEvaluator(
         // Infer the key and value types if possible.
         const keyValueResult = getKeyAndValueTypesFromDictionary(
             node,
+            flags,
             keyTypes,
             valueTypes,
             /* forceStrictInference */ true,
@@ -13510,7 +13539,11 @@ export function createTypeEvaluator(
 
     // Attempts to infer the type of a dictionary statement. If hasExpectedType
     // is true, strict inference is used for the subexpressions.
-    function getTypeOfDictionaryInferred(node: DictionaryNode, hasExpectedType: boolean): TypeResult {
+    function getTypeOfDictionaryInferred(
+        node: DictionaryNode,
+        flags: EvaluatorFlags,
+        hasExpectedType: boolean
+    ): TypeResult {
         const fallbackType = hasExpectedType ? AnyType.create() : UnknownType.create();
         let keyType: Type = fallbackType;
         let valueType: Type = fallbackType;
@@ -13525,6 +13558,7 @@ export function createTypeEvaluator(
         // Infer the key and value types if possible.
         const keyValueResult = getKeyAndValueTypesFromDictionary(
             node,
+            flags,
             keyTypeResults,
             valueTypeResults,
             /* forceStrictInference */ hasExpectedType,
@@ -13586,6 +13620,7 @@ export function createTypeEvaluator(
 
     function getKeyAndValueTypesFromDictionary(
         node: DictionaryNode,
+        flags: EvaluatorFlags,
         keyTypes: TypeResultWithNode[],
         valueTypes: TypeResultWithNode[],
         forceStrictInference: boolean,
@@ -13598,6 +13633,16 @@ export function createTypeEvaluator(
         let isIncomplete = false;
         let typeErrors = false;
 
+        // Mask out some of the flags that are not applicable for a dictionary key
+        // even if it appears within an inlined TypedDict annotation.
+        const keyFlags =
+            flags &
+            ~(
+                EvaluatorFlags.ExpectingTypeAnnotation |
+                EvaluatorFlags.EvaluateStringLiteralAsType |
+                EvaluatorFlags.ExpectingInstantiableType
+            );
+
         // Infer the key and value types if possible.
         node.entries.forEach((entryNode, index) => {
             let addUnknown = true;
@@ -13605,7 +13650,7 @@ export function createTypeEvaluator(
             if (entryNode.nodeType === ParseNodeType.DictionaryKeyEntry) {
                 const keyTypeResult = getTypeOfExpression(
                     entryNode.keyExpression,
-                    /* flags */ undefined,
+                    keyFlags | EvaluatorFlags.StripLiteralTypeForTuple,
                     makeInferenceContext(
                         expectedKeyType ?? (forceStrictInference ? NeverType.createNever() : undefined)
                     )
@@ -13645,7 +13690,7 @@ export function createTypeEvaluator(
                     entryInferenceContext = makeInferenceContext(effectiveValueType);
                     valueTypeResult = getTypeOfExpression(
                         entryNode.valueExpression,
-                        /* flags */ undefined,
+                        flags | EvaluatorFlags.StripLiteralTypeForTuple,
                         entryInferenceContext
                     );
                 } else {
@@ -13654,7 +13699,7 @@ export function createTypeEvaluator(
                     entryInferenceContext = makeInferenceContext(effectiveValueType);
                     valueTypeResult = getTypeOfExpression(
                         entryNode.valueExpression,
-                        /* flags */ undefined,
+                        flags | EvaluatorFlags.StripLiteralTypeForTuple,
                         entryInferenceContext
                     );
                 }
@@ -13717,7 +13762,7 @@ export function createTypeEvaluator(
                 const entryInferenceContext = makeInferenceContext(expectedType);
                 let unexpandedTypeResult = getTypeOfExpression(
                     entryNode.expandExpression,
-                    /* flags */ undefined,
+                    flags | EvaluatorFlags.StripLiteralTypeForTuple,
                     entryInferenceContext
                 );
 
@@ -13817,6 +13862,7 @@ export function createTypeEvaluator(
             } else if (entryNode.nodeType === ParseNodeType.ListComprehension) {
                 const dictEntryTypeResult = getElementTypeFromListComprehension(
                     entryNode,
+                    flags,
                     expectedValueType,
                     expectedKeyType
                 );
@@ -13868,6 +13914,12 @@ export function createTypeEvaluator(
             addDiagnostic(DiagnosticRule.reportInvalidTypeForm, LocMessage.listInAnnotation() + diag.getString(), node);
         }
 
+        flags &= ~(
+            EvaluatorFlags.ExpectingTypeAnnotation |
+            EvaluatorFlags.EvaluateStringLiteralAsType |
+            EvaluatorFlags.ExpectingInstantiableType
+        );
+
         // If the expected type is a union, recursively call for each of the subtypes
         // to find one that matches.
         let effectiveExpectedType = inferenceContext?.expectedType;
@@ -13885,7 +13937,7 @@ export function createTypeEvaluator(
                     }
 
                     const subtypeResult = useSpeculativeMode(node, () => {
-                        return getTypeOfListOrSetWithContext(node, makeInferenceContext(subtype));
+                        return getTypeOfListOrSetWithContext(node, flags, makeInferenceContext(subtype));
                     });
 
                     if (subtypeResult && assignType(subtype, subtypeResult.type)) {
@@ -13905,7 +13957,7 @@ export function createTypeEvaluator(
 
         let expectedTypeDiagAddendum: DiagnosticAddendum | undefined;
         if (effectiveExpectedType) {
-            const result = getTypeOfListOrSetWithContext(node, makeInferenceContext(effectiveExpectedType));
+            const result = getTypeOfListOrSetWithContext(node, flags, makeInferenceContext(effectiveExpectedType));
             if (result && !result.typeErrors) {
                 return result;
             }
@@ -13913,7 +13965,11 @@ export function createTypeEvaluator(
             expectedTypeDiagAddendum = result?.expectedTypeDiagAddendum;
         }
 
-        const typeResult = getTypeOfListOrSetInferred(node, /* hasExpectedType */ inferenceContext !== undefined);
+        const typeResult = getTypeOfListOrSetInferred(
+            node,
+            flags,
+            /* hasExpectedType */ inferenceContext !== undefined
+        );
         return { ...typeResult, expectedTypeDiagAddendum };
     }
 
@@ -13921,6 +13977,7 @@ export function createTypeEvaluator(
     // Returns undefined if that type cannot be honored.
     function getTypeOfListOrSetWithContext(
         node: ListNode | SetNode,
+        flags: EvaluatorFlags,
         inferenceContext: InferenceContext
     ): TypeResult | undefined {
         const builtInClassName = node.nodeType === ParseNodeType.List ? 'list' : 'set';
@@ -13945,11 +14002,11 @@ export function createTypeEvaluator(
             let entryTypeResult: TypeResult;
 
             if (entry.nodeType === ParseNodeType.ListComprehension) {
-                entryTypeResult = getElementTypeFromListComprehension(entry, expectedEntryType);
+                entryTypeResult = getElementTypeFromListComprehension(entry, flags, expectedEntryType);
             } else {
                 entryTypeResult = getTypeOfExpression(
                     entry,
-                    /* flags */ undefined,
+                    flags | EvaluatorFlags.StripLiteralTypeForTuple,
                     makeInferenceContext(expectedEntryType)
                 );
             }
@@ -14044,7 +14101,11 @@ export function createTypeEvaluator(
     }
 
     // Attempts to infer the type of a list or set statement with no "expected type".
-    function getTypeOfListOrSetInferred(node: ListNode | SetNode, hasExpectedType: boolean): TypeResult {
+    function getTypeOfListOrSetInferred(
+        node: ListNode | SetNode,
+        flags: EvaluatorFlags,
+        hasExpectedType: boolean
+    ): TypeResult {
         const builtInClassName = node.nodeType === ParseNodeType.List ? 'list' : 'set';
         const verifyHashable = node.nodeType === ParseNodeType.Set;
         let isEmptyContainer = false;
@@ -14056,9 +14117,9 @@ export function createTypeEvaluator(
             let entryTypeResult: TypeResult;
 
             if (entry.nodeType === ParseNodeType.ListComprehension && !entry.isGenerator) {
-                entryTypeResult = getElementTypeFromListComprehension(entry);
+                entryTypeResult = getElementTypeFromListComprehension(entry, flags);
             } else {
-                entryTypeResult = getTypeOfExpression(entry);
+                entryTypeResult = getTypeOfExpression(entry, flags | EvaluatorFlags.StripLiteralTypeForTuple);
             }
 
             if (entryTypeResult.isIncomplete) {
@@ -14479,7 +14540,11 @@ export function createTypeEvaluator(
         return { type: functionType, isIncomplete, typeErrors };
     }
 
-    function getTypeOfListComprehension(node: ListComprehensionNode, inferenceContext?: InferenceContext): TypeResult {
+    function getTypeOfListComprehension(
+        node: ListComprehensionNode,
+        flags: EvaluatorFlags,
+        inferenceContext?: InferenceContext
+    ): TypeResult {
         let isIncomplete = false;
         let typeErrors = false;
 
@@ -14501,7 +14566,7 @@ export function createTypeEvaluator(
         const builtInIteratorType = getTypingType(node, isAsync ? 'AsyncGenerator' : 'Generator');
 
         const expectedEntryType = getExpectedEntryTypeForIterable(node, builtInIteratorType, inferenceContext);
-        const elementTypeResult = getElementTypeFromListComprehension(node, expectedEntryType);
+        const elementTypeResult = getElementTypeFromListComprehension(node, flags, expectedEntryType);
         if (elementTypeResult.isIncomplete) {
             isIncomplete = true;
         }
@@ -14610,6 +14675,7 @@ export function createTypeEvaluator(
     // as opposed to the entire list.
     function getElementTypeFromListComprehension(
         node: ListComprehensionNode,
+        flags: EvaluatorFlags,
         expectedValueOrElementType?: Type,
         expectedKeyType?: Type
     ): TypeResult {
@@ -14628,7 +14694,7 @@ export function createTypeEvaluator(
             // Create a tuple with the key/value types.
             const keyTypeResult = getTypeOfExpression(
                 node.expression.keyExpression,
-                /* flags */ undefined,
+                flags | EvaluatorFlags.StripLiteralTypeForTuple,
                 makeInferenceContext(expectedKeyType)
             );
             if (keyTypeResult.isIncomplete) {
@@ -14644,7 +14710,7 @@ export function createTypeEvaluator(
 
             const valueTypeResult = getTypeOfExpression(
                 node.expression.valueExpression,
-                /* flags */ undefined,
+                flags | EvaluatorFlags.StripLiteralTypeForTuple,
                 makeInferenceContext(expectedValueOrElementType)
             );
             if (valueTypeResult.isIncomplete) {
@@ -14666,13 +14732,13 @@ export function createTypeEvaluator(
             // The parser should have reported an error in this case because it's not allowed.
             getTypeOfExpression(
                 node.expression.expandExpression,
-                /* flags */ undefined,
+                flags | EvaluatorFlags.StripLiteralTypeForTuple,
                 makeInferenceContext(expectedValueOrElementType)
             );
         } else if (isExpressionNode(node)) {
             const exprTypeResult = getTypeOfExpression(
                 node.expression as ExpressionNode,
-                /* flags */ undefined,
+                flags | EvaluatorFlags.StripLiteralTypeForTuple,
                 makeInferenceContext(expectedValueOrElementType)
             );
             if (exprTypeResult.isIncomplete) {
@@ -24994,7 +25060,7 @@ export function createTypeEvaluator(
 
         let srcLastToPackIndex = srcDetails.params.findIndex((p, i) => {
             assert(destDetails.argsIndex !== undefined);
-            return i >= destDetails.argsIndex && p.source === ParameterSource.KeywordOnly;
+            return i >= destDetails.argsIndex && p.kind === ParameterKind.Keyword;
         });
         if (srcLastToPackIndex < 0) {
             srcLastToPackIndex = srcDetails.params.length;
@@ -25043,7 +25109,7 @@ export function createTypeEvaluator(
                     },
                     type: srcPositionalsType,
                     index: -1,
-                    source: ParameterSource.PositionOnly,
+                    kind: ParameterKind.Positional,
                 },
                 ...srcDetails.params.slice(
                     destDetails.argsIndex + srcPositionalsToPack.length,
@@ -25061,16 +25127,14 @@ export function createTypeEvaluator(
             );
             srcDetails.kwargsIndex = kwargsIndex >= 0 ? kwargsIndex : undefined;
 
-            const firstKeywordOnlyIndex = srcDetails.params.findIndex(
-                (param) => param.source === ParameterSource.KeywordOnly
-            );
+            const firstKeywordOnlyIndex = srcDetails.params.findIndex((param) => param.kind === ParameterKind.Keyword);
             srcDetails.firstKeywordOnlyIndex = firstKeywordOnlyIndex >= 0 ? firstKeywordOnlyIndex : undefined;
 
             srcDetails.positionOnlyParamCount = Math.max(
                 0,
                 srcDetails.params.findIndex(
                     (p) =>
-                        p.source !== ParameterSource.PositionOnly ||
+                        p.kind !== ParameterKind.Positional ||
                         p.param.category !== ParameterCategory.Simple ||
                         p.param.hasDefault
                 )
@@ -25136,13 +25200,13 @@ export function createTypeEvaluator(
             const destParamName = destParam.param.name ?? '';
             const srcParamName = srcParam.param.name ?? '';
             if (destParamName) {
-                const isDestPositionalOnly = destParam.source === ParameterSource.PositionOnly;
+                const isDestPositionalOnly = destParam.kind === ParameterKind.Positional;
                 if (
                     !isDestPositionalOnly &&
                     destParam.param.category !== ParameterCategory.ArgsList &&
                     srcParam.param.category !== ParameterCategory.ArgsList
                 ) {
-                    if (srcParam.source === ParameterSource.PositionOnly) {
+                    if (srcParam.kind === ParameterKind.Positional) {
                         diag?.createAddendum().addMessage(
                             LocAddendum.functionParamPositionOnly().format({
                                 name: destParamName,
@@ -25212,12 +25276,12 @@ export function createTypeEvaluator(
                     canAssign = false;
                 }
             } else if (
-                destParam.source !== ParameterSource.PositionOnly &&
-                srcParam.source === ParameterSource.PositionOnly &&
+                destParam.kind !== ParameterKind.Positional &&
+                srcParam.kind === ParameterKind.Positional &&
                 srcParamDetails.kwargsIndex === undefined &&
                 !srcParamDetails.params.some(
                     (p) =>
-                        p.source === ParameterSource.KeywordOnly &&
+                        p.kind === ParameterKind.Keyword &&
                         p.param.category === ParameterCategory.Simple &&
                         p.param.name === destParam.param.name
                 )
@@ -25245,75 +25309,83 @@ export function createTypeEvaluator(
             canAssign = false;
         }
 
-        if (destPositionalCount < srcPositionalCount) {
-            // If the dest type includes a ParamSpec, the additional parameters
-            // can be assigned to it, so no need to report an error here.
-            if (!targetIncludesParamSpec) {
+        if (destPositionalCount < srcPositionalCount && !targetIncludesParamSpec) {
+            for (let i = destPositionalCount; i < srcPositionalCount; i++) {
+                // If the dest has an *args parameter, make sure it can accept the remaining
+                // positional arguments in the source.
+                if (destParamDetails.argsIndex !== undefined) {
+                    const destArgsType = destParamDetails.params[destParamDetails.argsIndex].type;
+                    const srcParamType = srcParamDetails.params[i].type;
+                    if (
+                        !assignFunctionParameter(
+                            destArgsType,
+                            srcParamType,
+                            i,
+                            diag?.createAddendum(),
+                            destTypeVarContext,
+                            srcTypeVarContext,
+                            flags,
+                            recursionCount
+                        )
+                    ) {
+                        canAssign = false;
+                    }
+
+                    continue;
+                }
+
+                // If The source parameter has a default value, it is OK for the
+                // corresponding dest parameter to be missing.
+                const srcParam = srcParamDetails.params[i];
+
+                if (srcParam.param.hasDefault) {
+                    // Assign default arg value in case it is needed for
+                    // populating TypeVar constraints.
+                    const paramInfo = srcParamDetails.params[i];
+                    const defaultArgType = paramInfo.defaultArgType ?? paramInfo.param.defaultType;
+
+                    if (
+                        defaultArgType &&
+                        !assignType(
+                            paramInfo.type,
+                            defaultArgType,
+                            diag?.createAddendum(),
+                            srcTypeVarContext,
+                            /* destTypeVarContext */ undefined,
+                            flags,
+                            recursionCount
+                        )
+                    ) {
+                        canAssign = false;
+                    }
+
+                    continue;
+                }
+
+                // If the source parameter is also addressible by keyword, it is OK
+                // that there is no matching positional parameter in the dest.
+                if (srcParam.kind === ParameterKind.Standard) {
+                    continue;
+                }
+
+                // If the source parameter is a variadic, it is OK that there is no
+                // matching positional parameter in the dest.
+                if (srcParam.param.category === ParameterCategory.ArgsList) {
+                    continue;
+                }
+
                 const nonDefaultSrcParamCount = srcParamDetails.params.filter(
                     (p) => !!p.param.name && !p.param.hasDefault && p.param.category === ParameterCategory.Simple
                 ).length;
 
-                if (destParamDetails.argsIndex === undefined) {
-                    if (destPositionalCount < nonDefaultSrcParamCount) {
-                        if (
-                            destParamDetails.firstPositionOrKeywordIndex > 0 &&
-                            destParamDetails.firstPositionOrKeywordIndex < srcPositionalCount
-                        ) {
-                            diag?.createAddendum().addMessage(
-                                LocAddendum.functionTooFewParams().format({
-                                    expected: nonDefaultSrcParamCount,
-                                    received: destPositionalCount,
-                                })
-                            );
-                            canAssign = false;
-                        }
-                    } else {
-                        // Assign default arg values in case they are needed for
-                        // populating TypeVar constraints.
-                        for (let i = destParamDetails.firstPositionOrKeywordIndex; i < srcPositionalCount; i++) {
-                            const paramInfo = srcParamDetails.params[i];
-                            const defaultArgType = paramInfo.defaultArgType ?? paramInfo.param.defaultType;
-
-                            if (
-                                defaultArgType &&
-                                !assignType(
-                                    paramInfo.type,
-                                    defaultArgType,
-                                    diag?.createAddendum(),
-                                    srcTypeVarContext,
-                                    /* destTypeVarContext */ undefined,
-                                    flags,
-                                    recursionCount
-                                )
-                            ) {
-                                canAssign = false;
-                            }
-                        }
-                    }
-                } else {
-                    // Make sure the remaining positional arguments are of the
-                    // correct type for the *args parameter.
-                    const destArgsType = destParamDetails.params[destParamDetails.argsIndex].type;
-                    if (!isAnyOrUnknown(destArgsType)) {
-                        for (let paramIndex = destPositionalCount; paramIndex < srcPositionalCount; paramIndex++) {
-                            const srcParamType = srcParamDetails.params[paramIndex].type;
-                            if (
-                                !assignFunctionParameter(
-                                    destArgsType,
-                                    srcParamType,
-                                    paramIndex,
-                                    diag?.createAddendum(),
-                                    destTypeVarContext,
-                                    srcTypeVarContext,
-                                    flags,
-                                    recursionCount
-                                )
-                            ) {
-                                canAssign = false;
-                            }
-                        }
-                    }
-                }
+                diag?.createAddendum().addMessage(
+                    LocAddendum.functionTooFewParams().format({
+                        expected: nonDefaultSrcParamCount,
+                        received: destPositionalCount,
+                    })
+                );
+                canAssign = false;
+                break;
             }
         } else if (srcPositionalCount < destPositionalCount) {
             if (srcParamDetails.argsIndex !== undefined) {
@@ -25346,7 +25418,7 @@ export function createTypeEvaluator(
                         }
 
                         if (
-                            destParamDetails.params[paramIndex].source !== ParameterSource.PositionOnly &&
+                            destParamDetails.params[paramIndex].kind !== ParameterKind.Positional &&
                             srcParamDetails.kwargsIndex === undefined
                         ) {
                             diag?.addMessage(
@@ -25460,7 +25532,7 @@ export function createTypeEvaluator(
                         if (
                             srcParamInfo.param.name &&
                             srcParamInfo.param.category === ParameterCategory.Simple &&
-                            srcParamInfo.source !== ParameterSource.PositionOnly
+                            srcParamInfo.kind !== ParameterKind.Positional
                         ) {
                             const destParamInfo = destParamMap.get(srcParamInfo.param.name);
                             const paramDiag = diag?.createAddendum();
@@ -25468,7 +25540,7 @@ export function createTypeEvaluator(
 
                             if (!destParamInfo) {
                                 if (destParamDetails.kwargsIndex === undefined && !srcParamInfo.param.hasDefault) {
-                                    if (paramDiag && srcParamDetails.firstKeywordOnlyIndex !== undefined) {
+                                    if (paramDiag) {
                                         paramDiag.addMessage(
                                             LocAddendum.namedParamMissingInDest().format({
                                                 name: srcParamInfo.param.name,
@@ -25880,7 +25952,9 @@ export function createTypeEvaluator(
                     if (isAnyOrUnknown(expectedTypeArgType) || isAnyOrUnknown(typeArg)) {
                         replacedTypeArg = true;
                         return expectedTypeArgType;
-                    } else if (isClassInstance(expectedTypeArgType) && isClassInstance(typeArg)) {
+                    }
+
+                    if (isClassInstance(expectedTypeArgType) && isClassInstance(typeArg)) {
                         // Recursively replace Any in the type argument.
                         const recursiveReplacement = replaceTypeArgsWithAny(
                             node,
@@ -25888,6 +25962,7 @@ export function createTypeEvaluator(
                             typeArg,
                             recursionCount
                         );
+
                         if (recursiveReplacement) {
                             replacedTypeArg = true;
                             return recursiveReplacement;
@@ -25932,6 +26007,12 @@ export function createTypeEvaluator(
     // When a value is assigned to a variable with a declared type,
     // we may be able to narrow the type based on the assignment.
     function narrowTypeBasedOnAssignment(node: ExpressionNode, declaredType: Type, assignedType: Type): Type {
+        // TODO: The rules for narrowing types on assignment are defined in
+        // the typing spec. Pyright's current logic is currently not even internally
+        // consistent and probably not sound from a type theory perspective. It
+        // should be completely reworked once there has been a public discussion
+        // about the correct behavior.
+
         const narrowedType = mapSubtypes(assignedType, (assignedSubtype) => {
             // Handle the special case where the assigned type is a literal type.
             // Some types include very large unions of literal types, and we don't
@@ -25973,8 +26054,18 @@ export function createTypeEvaluator(
                     }
 
                     // If the declared type doesn't contain any `Any` but the assigned
-                    // type does, stick with the declared type.
-                    if (containsAnyRecursive(assignedSubtype) && !containsAnyRecursive(declaredSubtype)) {
+                    // type does, stick with the declared type. We don't include unknowns
+                    // in the assigned subtype check here so unknowns are preserved so
+                    // reportUnknownVariableType assignment diagnostics are reported.
+
+                    // TODO - this is an inconsistency because Any and Unknown should
+                    // always be treated the same for purposes of type narrowing. This
+                    // should be revisited once the narrowing-on-assignment behavior
+                    // is properly specified in the typing spec.
+                    if (
+                        containsAnyRecursive(assignedSubtype, /* includeUnknown */ false) &&
+                        !containsAnyRecursive(declaredSubtype)
+                    ) {
                         return declaredSubtype;
                     }
 
@@ -26305,14 +26396,14 @@ export function createTypeEvaluator(
                 if (
                     i >= baseParamDetails.positionOnlyParamCount &&
                     !isPrivateOrProtectedName(baseParam.name || '') &&
-                    baseParamDetails.params[i].source !== ParameterSource.PositionOnly &&
+                    baseParamDetails.params[i].kind !== ParameterKind.Positional &&
                     baseParam.category === ParameterCategory.Simple &&
                     enforceParamNames &&
                     baseParam.name !== overrideParam.name
                 ) {
                     if (overrideParam.category === ParameterCategory.Simple) {
                         if (!baseParam.isNameSynthesized) {
-                            if (overrideParamDetails.params[i].source === ParameterSource.PositionOnly) {
+                            if (overrideParamDetails.params[i].kind === ParameterKind.Positional) {
                                 diag?.addMessage(
                                     LocAddendum.overrideParamNamePositionOnly().format({
                                         index: i + 1,
@@ -26335,10 +26426,7 @@ export function createTypeEvaluator(
                     i < overrideParamDetails.positionOnlyParamCount &&
                     i >= baseParamDetails.positionOnlyParamCount
                 ) {
-                    if (
-                        !baseParam.isNameSynthesized &&
-                        baseParamDetails.params[i].source !== ParameterSource.PositionOnly
-                    ) {
+                    if (!baseParam.isNameSynthesized && baseParamDetails.params[i].kind !== ParameterKind.Positional) {
                         diag?.addMessage(
                             LocAddendum.overrideParamNamePositionOnly().format({
                                 index: i + 1,
@@ -26398,7 +26486,7 @@ export function createTypeEvaluator(
                     const baseParam = baseParamDetails.params[i];
 
                     if (
-                        baseParam.source === ParameterSource.PositionOrKeyword &&
+                        baseParam.kind === ParameterKind.Standard &&
                         baseParam.param.category === ParameterCategory.Simple
                     ) {
                         diag?.addMessage(
@@ -26450,13 +26538,11 @@ export function createTypeEvaluator(
             // Now check any keyword-only parameters.
             const baseKwOnlyParams = baseParamDetails.params.filter(
                 (paramInfo) =>
-                    paramInfo.source === ParameterSource.KeywordOnly &&
-                    paramInfo.param.category === ParameterCategory.Simple
+                    paramInfo.kind === ParameterKind.Keyword && paramInfo.param.category === ParameterCategory.Simple
             );
             const overrideKwOnlyParams = overrideParamDetails.params.filter(
                 (paramInfo) =>
-                    paramInfo.source === ParameterSource.KeywordOnly &&
-                    paramInfo.param.category === ParameterCategory.Simple
+                    paramInfo.kind === ParameterKind.Keyword && paramInfo.param.category === ParameterCategory.Simple
             );
 
             baseKwOnlyParams.forEach((paramInfo) => {
